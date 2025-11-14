@@ -15,7 +15,13 @@ app.use(bodyParser.urlencoded({ extended: false }));
 
 // ---------------- DATA STORES ----------------
 const sessions = new Map();   // token -> { created, username }
-const requests = [];          // immigration requests in memory
+
+// NOTE: requests[] + the /immigration-request + /status endpoints are
+// still here for compatibility, but the PANEL now uses GROUP RANKS.
+const requests = [];
+
+// Simple in-memory comments: userId -> comment (resets on restart)
+const comments = new Map();
 
 // ---------------- AUTH CONFIG (NO USERS IN CODE) ----------------
 // ADMIN_ACCOUNTS (env) = JSON string like:
@@ -57,8 +63,14 @@ const IMMIGRATION_ROLE_ID = parseInt(
   10
 );
 
-// rank to this when request is denied
-const DENIED_ROLE_ID = 235;
+// Role for “Immigration Office” (pending applicants)
+const IMMIGRATION_APPLICANT_ROLE_ID = parseInt(
+  process.env.IMMIGRATION_APPLICANT_ROLE_ID || "0",
+  10
+);
+
+// rank to this when request is denied / failed immigration
+const DENIED_ROLE_ID = parseInt(process.env.DENIED_ROLE_ID || "235", 10);
 
 // ---------------- SMALL HELPERS ----------------
 function escapeHtml(str = "") {
@@ -152,6 +164,36 @@ async function rankRobloxUser(userId, desiredState, outcome) {
   }
 }
 
+// ---------------- HELPERS: FETCH MEMBERS BY ROLE ----------------
+// Uses Roblox Groups API directly via fetch
+async function fetchRoleMembers(roleId) {
+  if (!IMMIGRATION_GROUP_ID || !roleId) return [];
+  const members = [];
+  let cursor = "";
+
+  try {
+    while (true) {
+      const url =
+        `https://groups.roblox.com/v1/groups/${IMMIGRATION_GROUP_ID}` +
+        `/roles/${roleId}/users?limit=100` +
+        (cursor ? `&cursor=${cursor}` : "");
+
+      const r = await fetch(url);
+      const data = await r.json();
+      if (Array.isArray(data.data)) {
+        members.push(...data.data);
+      }
+      if (!data.nextPageCursor) break;
+      cursor = data.nextPageCursor;
+    }
+  } catch (e) {
+    console.error("[FETCH ROLE MEMBERS]", roleId, e);
+  }
+
+  // each member looks like: {user:{userId,username,displayName}, role:{...}, ...}
+  return members;
+}
+
 // ---------------- LOGIN ROUTES ----------------
 app.get("/login", (req, res) => {
   const html = `
@@ -212,7 +254,7 @@ app.get("/logout", requireAuth, (req, res) => {
   res.redirect("/login");
 });
 
-// ---------------- ROUTES: ROBLOX API ENTRY (FROM GAME) ----------------
+// ---------------- (LEGACY) ROUTES: ROBLOX API ENTRY FROM GAME ----------------
 app.post("/immigration-request", (req, res) => {
   const data = req.body || {};
   const id = requests.length === 0 ? 1 : requests[requests.length - 1].id + 1;
@@ -228,8 +270,7 @@ app.post("/immigration-request", (req, res) => {
   res.json({ ok: true, id });
 });
 
-// ---------------- STATUS ENDPOINT (USED BY ROBLOX) ----------------
-// GET /status?userId=123
+// GET /status?userId=123 (still based on in-memory requests)
 app.get("/status", (req, res) => {
   const userId = parseInt(req.query.userId, 10);
   if (!userId) {
@@ -255,28 +296,32 @@ app.get("/status", (req, res) => {
 });
 
 // ---------------- DECISION (ACCEPT / DENY) ----------------
+// Now uses userId instead of an internal request id.
 app.post("/request/decision", requireAuth, async (req, res) => {
-  const id = parseInt(req.body.id, 10);
-  const decision = req.body.decision;
+  const userId = parseInt(req.body.userId, 10);
+  const decision = req.body.decision; // "accept" or "deny"
 
-  const r = requests.find((x) => x.id === id);
-  if (!r) {
-    return res.status(404).send("Request not found");
+  if (!userId || !["accept", "deny"].includes(decision)) {
+    return res.status(400).send("Bad request");
   }
 
-  if (decision === "accept") {
-    r.status = "accepted";
-    await rankRobloxUser(r.UserId, r.DesiredState, "accepted");
-  } else if (decision === "deny") {
-    r.status = "denied";
-    await rankRobloxUser(r.UserId, r.DesiredState, "denied");
-  }
+  const outcome = decision === "accept" ? "accepted" : "denied";
+  await rankRobloxUser(userId, "N/A", outcome);
 
   res.redirect("/panel");
 });
 
+// ---------------- COMMENTS ----------------
+app.post("/comment", requireAuth, (req, res) => {
+  const userId = parseInt(req.body.userId, 10);
+  const text = String(req.body.comment || "").slice(0, 1000);
+  if (userId) {
+    comments.set(userId, text);
+  }
+  res.redirect("/panel");
+});
+
 // ---------------- PROXY ROUTES (AVOID CORS) ----------------
-// Node 22 has global fetch, so no extra dependency.
 async function proxyJson(res, url) {
   try {
     const r = await fetch(url);
@@ -330,10 +375,14 @@ app.get("/proxy/groups/:userId", (req, res) => {
   );
 });
 
-// ---------------- PANEL (ALT DETECTION + GROUPS) ----------------
-app.get("/panel", requireAuth, (req, res) => {
+// ---------------- PANEL (GROUP-BASED QUEUES) ----------------
+app.get("/panel", requireAuth, async (req, res) => {
   const loggedInAs = req.session.username || "unknown";
   const blacklistArr = JSON.stringify(BLACKLISTED_GROUPS);
+
+  // Fetch Immigration Office (pending) and Failed Immigration members
+  const applicants = await fetchRoleMembers(IMMIGRATION_APPLICANT_ROLE_ID);
+  const failedImmigration = await fetchRoleMembers(DENIED_ROLE_ID);
 
   let html = `
   <html>
@@ -344,10 +393,18 @@ app.get("/panel", requireAuth, (req, res) => {
         header { display:flex; justify-content:space-between; align-items:center;
                  padding:16px 24px; background:#101018; border-bottom:1px solid #222; }
         header h1 { margin:0; font-size:22px; }
-        header .right { font-size:13px; color:#aaa; }
+        header .right { font-size:13px; color:#aaa; display:flex; align-items:center; gap:8px; }
         header a { color:#f06464; text-decoration:none; margin-left:12px; }
 
+        .refresh-btn {
+          background:#222; color:#eee; border:none;
+          border-radius:50%; width:28px; height:28px; cursor:pointer;
+        }
+        .refresh-btn:hover { background:#333; }
+
         .container { padding:20px; }
+        h2.section-title { margin-top:0; margin-bottom:12px; }
+
         .grid { display:flex; flex-wrap:wrap; gap:16px; }
         .card { background:#15151f; border-radius:10px; padding:14px;
                 width:420px; box-shadow:0 0 15px rgba(0,0,0,0.4); }
@@ -389,13 +446,29 @@ app.get("/panel", requireAuth, (req, res) => {
         }
         .accept { background:#2e8b57; color:#fff; }
         .deny { background:#8b2e2e; color:#fff; }
+
+        form.comment-form { margin-top:10px; display:flex; flex-direction:column; gap:6px; }
+        form.comment-form textarea {
+          width:100%; min-height:60px; resize:vertical;
+          border-radius:4px; border:1px solid #333; background:#101018; color:#eee;
+          font-size:12px; padding:6px;
+        }
+        form.comment-form button {
+          align-self:flex-end; padding:6px 10px; border:none;
+          border-radius:4px; background:#3b82f6; color:#fff;
+          font-size:12px; cursor:pointer;
+        }
+        form.comment-form button:hover { background:#2563eb; }
+
+        .empty { color:#888; font-size:14px; }
       </style>
     </head>
     <body>
       <header>
-        <h1>Immigration Requests (${requests.length})</h1>
+        <h1>Immigration Requests (${applicants.length})</h1>
         <div class="right">
           Logged in as <b>${escapeHtml(loggedInAs)}</b>
+          <button class="refresh-btn" title="Refresh" onclick="window.location.reload()">⟳</button>
           <a href="/logout">Logout</a>
         </div>
       </header>
@@ -403,47 +476,114 @@ app.get("/panel", requireAuth, (req, res) => {
       <div class="container">
   `;
 
-  if (requests.length === 0) {
-    html += `<p>No immigration requests yet.</p>`;
+  // ---------- PENDING (Immigration Office) ----------
+  html += `
+      <section>
+        <h2 class="section-title">Pending Immigration (Immigration Office)</h2>
+  `;
+
+  if (applicants.length === 0) {
+    html += `<p class="empty">No pending immigration members in Immigration Office rank.</p>`;
   } else {
-    const sorted = [...requests].sort(
-      (a, b) => (a.serverReceivedAt || 0) - (b.serverReceivedAt || 0)
-    );
-
     html += `<div class="grid">`;
+    for (const m of applicants) {
+      const userId = m.user.userId;
+      const username = m.user.username;
+      const status = "pending";
+      const comment = comments.get(userId) || "";
 
-    for (const r of sorted) {
       html += `
-      <div class="card" data-user-id="${r.UserId}">
-        <div class="card-header">
-          <img class="avatar" src="" />
-          <div>
-            <div class="name">${escapeHtml(r.RobloxName)}</div>
-            <div class="meta">UserId: ${r.UserId}</div>
-            <div class="meta roblox-age">Account age: loading...</div>
-            <div class="status-pill status-${r.status}">${r.status}</div>
+        <div class="card" data-user-id="${userId}">
+          <div class="card-header">
+            <img class="avatar" src="" />
+            <div>
+              <div class="name">${escapeHtml(username)}</div>
+              <div class="meta">UserId: ${userId}</div>
+              <div class="meta roblox-age">Account age: loading...</div>
+              <div class="status-pill status-${status}">${status}</div>
+            </div>
           </div>
+
+          <div class="alt-status alt-loading">Alt Status: Loading...</div>
+
+          <div class="section">
+            <b>Groups</b>
+            <div class="groups-list">Loading groups...</div>
+          </div>
+
+          <form class="actions" method="POST" action="/request/decision">
+            <input type="hidden" name="userId" value="${userId}" />
+            <button type="submit" name="decision" value="accept" class="accept">Accept</button>
+            <button type="submit" name="decision" value="deny" class="deny">Deny</button>
+          </form>
+
+          <form class="comment-form" method="POST" action="/comment">
+            <input type="hidden" name="userId" value="${userId}" />
+            <textarea name="comment" placeholder="Comment (visible to staff only)...">${escapeHtml(comment)}</textarea>
+            <button type="submit">Save Comment</button>
+          </form>
         </div>
-
-        <div class="alt-status alt-loading">Alt Status: Loading...</div>
-
-        <div class="section">
-          <b>Groups</b>
-          <div class="groups-list">Loading groups...</div>
-        </div>
-
-        <form class="actions" method="POST" action="/request/decision">
-          <input type="hidden" name="id" value="${r.id}" />
-          <button type="submit" name="decision" value="accept" class="accept">Accept</button>
-          <button type="submit" name="decision" value="deny" class="deny">Deny</button>
-        </form>
-      </div>`;
+      `;
     }
+    html += `</div>`;
+  }
 
+  html += `</section>`;
+
+  // ---------- FAILED IMMIGRATION ----------
+  html += `
+      <section style="margin-top:32px;">
+        <h2 class="section-title">Failed Immigration</h2>
+  `;
+
+  if (failedImmigration.length === 0) {
+    html += `<p class="empty">No members in Failed Immigration rank.</p>`;
+  } else {
+    html += `<div class="grid">`;
+    for (const m of failedImmigration) {
+      const userId = m.user.userId;
+      const username = m.user.username;
+      const status = "denied";
+      const comment = comments.get(userId) || "";
+
+      html += `
+        <div class="card" data-user-id="${userId}">
+          <div class="card-header">
+            <img class="avatar" src="" />
+            <div>
+              <div class="name">${escapeHtml(username)}</div>
+              <div class="meta">UserId: ${userId}</div>
+              <div class="meta roblox-age">Account age: loading...</div>
+              <div class="status-pill status-${status}">${status}</div>
+            </div>
+          </div>
+
+          <div class="alt-status alt-loading">Alt Status: Loading...</div>
+
+          <div class="section">
+            <b>Groups</b>
+            <div class="groups-list">Loading groups...</div>
+          </div>
+
+          <!-- Already declined: only allow ACCEPT (for appeals), no deny button -->
+          <form class="actions" method="POST" action="/request/decision">
+            <input type="hidden" name="userId" value="${userId}" />
+            <button type="submit" name="decision" value="accept" class="accept">Accept</button>
+          </form>
+
+          <form class="comment-form" method="POST" action="/comment">
+            <input type="hidden" name="userId" value="${userId}" />
+            <textarea name="comment" placeholder="Comment (reason for failure, notes, etc.)...">${escapeHtml(comment)}</textarea>
+            <button type="submit">Save Comment</button>
+          </form>
+        </div>
+      `;
+    }
     html += `</div>`;
   }
 
   html += `
+      </section>
       </div>
 
 <script>
@@ -504,7 +644,7 @@ app.get("/panel", requireAuth, (req, res) => {
       console.error(e);
     }
 
-    // Groups (for scoring only; actual list done separately)
+    // Groups (for scoring only)
     try {
       const res = await fetch("/proxy/groups/" + userId);
       const data = await res.json();
@@ -529,78 +669,78 @@ app.get("/panel", requireAuth, (req, res) => {
 
   // ---- GROUP LIST ----
   async function loadGroups(card, userId) {
-  const container = card.querySelector(".groups-list");
-  try {
-    const res = await fetch("/proxy/groups/" + userId);
-    const data = await res.json();
-    const groups = data.data || [];
+    const container = card.querySelector(".groups-list");
+    try {
+      const res = await fetch("/proxy/groups/" + userId);
+      const data = await res.json();
+      const groups = data.data || [];
 
-    if (groups.length === 0) {
-      container.textContent = "No groups.";
-      return;
-    }
+      if (groups.length === 0) {
+        container.textContent = "No groups.";
+        return;
+      }
 
-    container.innerHTML = "";
-    for (const g of groups) {
-      const groupId = g.group.id;
-      const row = document.createElement("div");
-      row.className = "group-row";
+      container.innerHTML = "";
+      for (const g of groups) {
+        const groupId = g.group.id;
+        const row = document.createElement("div");
+        row.className = "group-row";
 
-      // --- get icon URL via proxy -> thumbnails API ---
-      let iconUrl = "";
-      try {
-        const iconRes = await fetch("/proxy/groupIcon/" + groupId);
-        const iconJson = await iconRes.json();
-        if (iconJson.data && iconJson.data[0] && iconJson.data[0].imageUrl) {
-          iconUrl = iconJson.data[0].imageUrl;
+        // --- get icon URL via proxy -> thumbnails API ---
+        let iconUrl = "";
+        try {
+          const iconRes = await fetch("/proxy/groupIcon/" + groupId);
+          const iconJson = await iconRes.json();
+          if (iconJson.data && iconJson.data[0] && iconJson.data[0].imageUrl) {
+            iconUrl = iconJson.data[0].imageUrl;
+          }
+        } catch (e) {
+          console.error("[GROUP ICON]", e);
         }
-      } catch (e) {
-        console.error("[GROUP ICON]", e);
+
+        const icon = document.createElement("img");
+        icon.className = "group-icon";
+        if (iconUrl) {
+          icon.src = iconUrl;
+        }
+
+        const textWrap = document.createElement("div");
+        textWrap.className = "group-text";
+
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "group-name";
+        nameSpan.textContent = g.group.name;
+
+        const roleSpan = document.createElement("span");
+        roleSpan.className = "group-role";
+        roleSpan.textContent = "Role: " + g.role.name;
+
+        textWrap.appendChild(nameSpan);
+        textWrap.appendChild(roleSpan);
+
+        if (BLACKLISTED_GROUP_IDS.includes(groupId)) {
+          row.classList.add("blacklisted");
+          const tag = document.createElement("span");
+          tag.textContent = "BLACKLISTED";
+          tag.style.fontSize = "10px";
+          tag.style.fontWeight = "bold";
+          tag.style.marginLeft = "4px";
+          tag.style.padding = "1px 6px";
+          tag.style.borderRadius = "999px";
+          tag.style.background = "#c02424";
+          tag.style.color = "#fff";
+          textWrap.appendChild(tag);
+        }
+
+        row.appendChild(icon);
+        row.appendChild(textWrap);
+        container.appendChild(row);
       }
-
-      const icon = document.createElement("img");
-      icon.className = "group-icon";
-      if (iconUrl) {
-        icon.src = iconUrl;
-      }
-
-      const textWrap = document.createElement("div");
-      textWrap.className = "group-text";
-
-      const nameSpan = document.createElement("span");
-      nameSpan.className = "group-name";
-      nameSpan.textContent = g.group.name;
-
-      const roleSpan = document.createElement("span");
-      roleSpan.className = "group-role";
-      roleSpan.textContent = "Role: " + g.role.name;
-
-      textWrap.appendChild(nameSpan);
-      textWrap.appendChild(roleSpan);
-
-      if (BLACKLISTED_GROUP_IDS.includes(groupId)) {
-        row.classList.add("blacklisted");
-        const tag = document.createElement("span");
-        tag.textContent = "BLACKLISTED";
-        tag.style.fontSize = "10px";
-        tag.style.fontWeight = "bold";
-        tag.style.marginLeft = "4px";
-        tag.style.padding = "1px 6px";
-        tag.style.borderRadius = "999px";
-        tag.style.background = "#c02424";
-        tag.style.color = "#fff";
-        textWrap.appendChild(tag);
-      }
-
-      row.appendChild(icon);
-      row.appendChild(textWrap);
-      container.appendChild(row);
+    } catch (e) {
+      console.error(e);
+      container.textContent = "Failed to load groups.";
     }
-  } catch (e) {
-    console.error(e);
-    container.textContent = "Failed to load groups.";
   }
-}
 
   // ---- INIT ----
   function init() {
