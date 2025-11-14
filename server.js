@@ -293,6 +293,14 @@ app.get("/proxy/user/:userId", (req, res) => {
   proxyJson(res, `https://users.roblox.com/v1/users/${userId}`);
 });
 
+app.get("/proxy/groupIcon/:groupId", (req, res) => {
+  const { groupId } = req.params;
+  proxyJson(
+    res,
+    `https://thumbnails.roblox.com/v1/groups/icons?groupIds=${groupId}&size=420x420&format=Png&isCircular=false`
+  );
+});
+
 app.get("/proxy/friends/:userId", (req, res) => {
   const { userId } = req.params;
   proxyJson(res, `https://friends.roblox.com/v1/users/${userId}/friends/count`);
@@ -521,67 +529,78 @@ app.get("/panel", requireAuth, (req, res) => {
 
   // ---- GROUP LIST ----
   async function loadGroups(card, userId) {
-    const container = card.querySelector(".groups-list");
-    try {
-      const res = await fetch("/proxy/groups/" + userId);
-      const data = await res.json();
-      const groups = data.data || [];
+  const container = card.querySelector(".groups-list");
+  try {
+    const res = await fetch("/proxy/groups/" + userId);
+    const data = await res.json();
+    const groups = data.data || [];
 
-      if (groups.length === 0) {
-        container.textContent = "No groups.";
-        return;
-      }
-
-      container.innerHTML = "";
-      for (const g of groups) {
-        const groupId = g.group.id;
-        const row = document.createElement("div");
-        row.className = "group-row";
-
-        const icon = document.createElement("img");
-        icon.className = "group-icon";
-        icon.src =
-          "https://thumbnails.roblox.com/v1/groups/icons?groupIds=" +
-          groupId +
-          "&size=150x150&format=Png&isCircular=false";
-
-        const textWrap = document.createElement("div");
-        textWrap.className = "group-text";
-
-        const nameSpan = document.createElement("span");
-        nameSpan.className = "group-name";
-        nameSpan.textContent = g.group.name;
-
-        const roleSpan = document.createElement("span");
-        roleSpan.className = "group-role";
-        roleSpan.textContent = "Role: " + g.role.name;
-
-        textWrap.appendChild(nameSpan);
-        textWrap.appendChild(roleSpan);
-
-        if (BLACKLISTED_GROUP_IDS.includes(groupId)) {
-          row.classList.add("blacklisted");
-          const tag = document.createElement("span");
-          tag.textContent = "BLACKLISTED";
-          tag.style.fontSize = "10px";
-          tag.style.fontWeight = "bold";
-          tag.style.marginLeft = "4px";
-          tag.style.padding = "1px 6px";
-          tag.style.borderRadius = "999px";
-          tag.style.background = "#c02424";
-          tag.style.color = "#fff";
-          textWrap.appendChild(tag);
-        }
-
-        row.appendChild(icon);
-        row.appendChild(textWrap);
-        container.appendChild(row);
-      }
-    } catch (e) {
-      console.error(e);
-      container.textContent = "Failed to load groups.";
+    if (groups.length === 0) {
+      container.textContent = "No groups.";
+      return;
     }
+
+    container.innerHTML = "";
+    for (const g of groups) {
+      const groupId = g.group.id;
+      const row = document.createElement("div");
+      row.className = "group-row";
+
+      // --- get icon URL via proxy -> thumbnails API ---
+      let iconUrl = "";
+      try {
+        const iconRes = await fetch("/proxy/groupIcon/" + groupId);
+        const iconJson = await iconRes.json();
+        if (iconJson.data && iconJson.data[0] && iconJson.data[0].imageUrl) {
+          iconUrl = iconJson.data[0].imageUrl;
+        }
+      } catch (e) {
+        console.error("[GROUP ICON]", e);
+      }
+
+      const icon = document.createElement("img");
+      icon.className = "group-icon";
+      if (iconUrl) {
+        icon.src = iconUrl;
+      }
+
+      const textWrap = document.createElement("div");
+      textWrap.className = "group-text";
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "group-name";
+      nameSpan.textContent = g.group.name;
+
+      const roleSpan = document.createElement("span");
+      roleSpan.className = "group-role";
+      roleSpan.textContent = "Role: " + g.role.name;
+
+      textWrap.appendChild(nameSpan);
+      textWrap.appendChild(roleSpan);
+
+      if (BLACKLISTED_GROUP_IDS.includes(groupId)) {
+        row.classList.add("blacklisted");
+        const tag = document.createElement("span");
+        tag.textContent = "BLACKLISTED";
+        tag.style.fontSize = "10px";
+        tag.style.fontWeight = "bold";
+        tag.style.marginLeft = "4px";
+        tag.style.padding = "1px 6px";
+        tag.style.borderRadius = "999px";
+        tag.style.background = "#c02424";
+        tag.style.color = "#fff";
+        textWrap.appendChild(tag);
+      }
+
+      row.appendChild(icon);
+      row.appendChild(textWrap);
+      container.appendChild(row);
+    }
+  } catch (e) {
+    console.error(e);
+    container.textContent = "Failed to load groups.";
   }
+}
 
   // ---- INIT ----
   function init() {
