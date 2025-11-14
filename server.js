@@ -58,6 +58,9 @@ const IMMIGRATION_ROLE_ID = parseInt(
   10
 );
 
+// rank to this when request is denied
+const DENIED_ROLE_ID = 235;
+
 // ---------------- SMALL HELPERS ----------------
 function escapeHtml(str = "") {
   return String(str)
@@ -114,13 +117,7 @@ async function initRoblox() {
   }
   try {
     const user = await noblox.setCookie(ROBLOX_COOKIE);
-
-    // TEMP: show exactly what noblox gives us
-    console.log("[ROBLOX] Login result object:", user);
-    console.log("[ROBLOX] Login result keys:", Object.keys(user));
-
-    // once you see the fields in the logs, you can change this to something like:
-    // console.log(`[ROBLOX] Logged in as ${user.name || user.Username} (ID: ${user.id || user.UserID})`);
+    console.log(`[ROBLOX] Logged in as ${user.name} (ID: ${user.id})`);
   } catch (e) {
     console.error("[ROBLOX] Failed to log in with cookie:", e);
   }
@@ -129,18 +126,28 @@ async function initRoblox() {
 initRoblox();
 
 // ---------------- RANKING FUNCTION ----------------
-async function rankRobloxUser(userId, desiredState) {
-  if (!ROBLOX_COOKIE || !IMMIGRATION_GROUP_ID || !IMMIGRATION_ROLE_ID) {
+async function rankRobloxUser(userId, desiredState, outcome) {
+  if (!ROBLOX_COOKIE || !IMMIGRATION_GROUP_ID) {
     console.warn(
-      "[RANKING] Missing ROBLOX_COOKIE / IMMIGRATION_GROUP_ID / IMMIGRATION_ROLE_ID; skipping rank."
+      "[RANKING] Missing ROBLOX_COOKIE / IMMIGRATION_GROUP_ID; skipping rank."
     );
     return;
   }
 
+  let roleId;
+  if (outcome === "accepted") {
+    roleId = IMMIGRATION_ROLE_ID;
+  } else if (outcome === "denied") {
+    roleId = DENIED_ROLE_ID;
+  } else {
+    console.warn("[RANKING] Unknown outcome:", outcome);
+    return;
+  }
+
   try {
-    await noblox.setRank(IMMIGRATION_GROUP_ID, Number(userId), IMMIGRATION_ROLE_ID);
+    await noblox.setRank(IMMIGRATION_GROUP_ID, Number(userId), roleId);
     console.log(
-      `[RANKING] Ranked user ${userId} to rank ${IMMIGRATION_ROLE_ID} in group ${IMMIGRATION_GROUP_ID} (state="${desiredState}")`
+      `[RANKING] Ranked user ${userId} to rank ${roleId} in group ${IMMIGRATION_GROUP_ID} (state="${desiredState}", outcome="${outcome}")`
     );
   } catch (e) {
     console.error("[RANKING] Failed to rank user:", userId, e);
@@ -217,26 +224,6 @@ app.post("/immigration-request", (req, res) => {
   res.json({ ok: true, id });
 });
 
-// ---------------- DECISION (ACCEPT / DENY) ----------------
-app.post("/request/decision", requireAuth, async (req, res) => {
-  const id = parseInt(req.body.id, 10);
-  const decision = req.body.decision;
-
-  const r = requests.find((x) => x.id === id);
-  if (!r) {
-    return res.status(404).send("Request not found");
-  }
-
-  if (decision === "accept") {
-    r.status = "accepted";
-    await rankRobloxUser(r.UserId, r.DesiredState);
-  } else if (decision === "deny") {
-    r.status = "denied";
-  }
-
-  res.redirect("/panel");
-});
-
 // ---------------- STATUS ENDPOINT (USED BY ROBLOX) ----------------
 // GET /status?userId=123
 app.get("/status", (req, res) => {
@@ -246,7 +233,7 @@ app.get("/status", (req, res) => {
   }
 
   // Find latest request for this user (by time/id)
-  const userRequests = requests.filter(r => Number(r.UserId) === userId);
+  const userRequests = requests.filter((r) => Number(r.UserId) === userId);
   if (userRequests.length === 0) {
     return res.json({ status: "none" });
   }
@@ -260,8 +247,29 @@ app.get("/status", (req, res) => {
   res.json({
     status: latest.status || "pending",
     lastId: latest.id,
-    lastTime: latest.serverReceivedAt || latest.TimeStamp || null
+    lastTime: latest.serverReceivedAt || latest.TimeStamp || null,
   });
+});
+
+// ---------------- DECISION (ACCEPT / DENY) ----------------
+app.post("/request/decision", requireAuth, async (req, res) => {
+  const id = parseInt(req.body.id, 10);
+  const decision = req.body.decision;
+
+  const r = requests.find((x) => x.id === id);
+  if (!r) {
+    return res.status(404).send("Request not found");
+  }
+
+  if (decision === "accept") {
+    r.status = "accepted";
+    await rankRobloxUser(r.UserId, r.DesiredState, "accepted");
+  } else if (decision === "deny") {
+    r.status = "denied";
+    await rankRobloxUser(r.UserId, r.DesiredState, "denied");
+  }
+
+  res.redirect("/panel");
 });
 
 // ---------------- PANEL ----------------
@@ -321,32 +329,32 @@ app.get("/panel", requireAuth, (req, res) => {
 
   if (requests.length === 0) {
     html += `<p class="empty">No requests yet. Once players file immigration forms in-game, they'll appear here.</p>`;
-  } } else {
-  // Oldest first (by serverReceivedAt or id)
-  const sorted = [...requests].sort((a, b) => {
-    const ta = a.serverReceivedAt || a.TimeStamp || 0;
-    const tb = b.serverReceivedAt || b.TimeStamp || 0;
-    return ta - tb;
-  });
+  } else {
+    // Oldest first (by serverReceivedAt or TimeStamp)
+    const sorted = [...requests].sort((a, b) => {
+      const ta = a.serverReceivedAt || a.TimeStamp || 0;
+      const tb = b.serverReceivedAt || b.TimeStamp || 0;
+      return ta - tb;
+    });
 
-  html += `<div class="grid">`;
+    html += `<div class="grid">`;
 
-  for (const r of sorted) {
-    const statusClass =
-      r.status === "accepted"
-        ? "status-accepted"
-        : r.status === "denied"
-        ? "status-denied"
-        : "status-pending";
+    for (const r of sorted) {
+      const statusClass =
+        r.status === "accepted"
+          ? "status-accepted"
+          : r.status === "denied"
+          ? "status-denied"
+          : "status-pending";
 
-    html += `
-      <div class="card" data-user-id="${r.UserId}" data-request-id="${r.id}">
-        ...
-    `;
-  }
-
-  html += `</div>`;
-})</div>
+      html += `
+        <div class="card" data-user-id="${r.UserId}" data-request-id="${r.id}">
+          <div class="card-header">
+            <img class="avatar" src="" alt="avatar" />
+            <div>
+              <div class="name">${escapeHtml(r.RobloxName)} (${escapeHtml(
+        r.DisplayName
+      )})</div>
               <div class="meta">UserId: ${r.UserId}</div>
               <div class="meta roblox-age">Roblox age: loading...</div>
               <div class="status-pill ${statusClass}">${r.status}</div>
