@@ -14,8 +14,8 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 // ---------------- DATA STORES ----------------
-const sessions = new Map();   // token -> { created, username }
-const requests = [];          // immigration requests in memory
+const sessions = new Map(); // token -> { created, username }
+const requests = [];        // immigration requests in memory
 
 // ---------------- AUTH CONFIG (NO USERS IN CODE) ----------------
 // ADMIN_ACCOUNTS = JSON string like:
@@ -272,9 +272,31 @@ app.post("/request/decision", requireAuth, async (req, res) => {
   res.redirect("/panel");
 });
 
-// ---------------- PANEL ----------------
+// ---------------- PROXY: GROUPS (SERVER -> ROBLOX) ----------------
+app.get("/proxy/groups/:userId", async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  if (!userId) {
+    return res.status(400).json({ error: "Invalid userId" });
+  }
+
+  try {
+    const rbRes = await fetch(
+      `https://groups.roblox.com/v1/users/${userId}/groups/roles`
+    );
+
+    const text = await rbRes.text();
+    res
+      .status(rbRes.status)
+      .set("Content-Type", rbRes.headers.get("content-type") || "application/json")
+      .send(text);
+  } catch (e) {
+    console.error("[PROXY/GROUPS] Error for user", userId, e);
+    res.status(500).json({ error: "Proxy error fetching groups" });
+  }
+});
+
+// ---------------- PANEL (ALT DETECTION) ----------------
 app.get("/panel", requireAuth, (req, res) => {
-  const blacklistArr = JSON.stringify(BLACKLISTED_GROUPS);
   const loggedInAs = req.session.username || "unknown";
 
   let html = `
@@ -287,33 +309,38 @@ app.get("/panel", requireAuth, (req, res) => {
         header h1 { margin:0; font-size:22px; }
         header .right { font-size:13px; color:#aaa; }
         header a { color:#f06464; text-decoration:none; margin-left:12px; }
+
         .container { padding:20px; }
         .grid { display:flex; flex-wrap:wrap; gap:16px; }
-        .card { background:#15151f; border-radius:10px; padding:14px; width:340px; box-shadow:0 0 15px rgba(0,0,0,0.4); display:flex; flex-direction:column; }
-        .card-header { display:flex; gap:12px; align-items:center; margin-bottom:8px; }
-        .avatar { width:64px; height:64px; border-radius:50%; background:#000; }
-        .name { font-weight:bold; font-size:15px; }
+        .card { background:#15151f; border-radius:10px; padding:14px; width:380px; box-shadow:0 0 15px rgba(0,0,0,0.4); }
+
+        .card-header { display:flex; gap:12px; align-items:center; }
+        .avatar { width:64px; height:64px; border-radius:50%; object-fit:cover; }
+
+        .name { font-weight:bold; font-size:16px; }
         .meta { font-size:12px; color:#aaa; }
-        .status-pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; margin-top:4px; }
-        .status-pending { background:#444; color:#eee; }
-        .status-accepted { background:#1f7a33; color:#e2ffe2; }
-        .status-denied { background:#7a1f1f; color:#ffe2e2; }
-        .section { margin-top:8px; font-size:13px; }
-        .reason { white-space:pre-wrap; margin-top:4px; background:#101018; border-radius:6px; padding:6px; max-height:100px; overflow:auto; }
-        .groups-list { margin-top:6px; max-height:140px; overflow:auto; }
-        .group-row { display:flex; align-items:center; gap:6px; margin-bottom:4px; font-size:12px; }
-        .group-icon { width:24px; height:24px; border-radius:4px; background:#000; flex-shrink:0; }
-        .group-name { font-weight:bold; }
-        .group-role { color:#bbb; }
-        .group-badge { font-size:10px; padding:1px 6px; border-radius:999px; margin-left:4px; background:#444; }
-        .group-badge.blacklisted { background:#c02424; color:#fff; }
-        form.actions { margin-top:10px; display:flex; gap:8px; }
-        form.actions button { flex:1; padding:6px 0; border:none; border-radius:4px; font-weight:bold; cursor:pointer; font-size:13px; }
-        form.actions .accept { background:#2e8b57; color:#fff; }
-        form.actions .accept:hover { background:#256e45; }
-        form.actions .deny { background:#8b2e2e; color:#fff; }
-        form.actions .deny:hover { background:#6d2424; }
-        .empty { color:#888; font-size:14px; }
+
+        .status-pill {
+          display:inline-block; padding:4px 10px; border-radius:8px; font-size:12px; margin-top:6px;
+        }
+        .status-pending { background:#444; }
+        .status-accepted { background:#1f7a33; }
+        .status-denied { background:#7a1f1f; }
+
+        .section { margin-top:12px; }
+        .section b { display:block; margin-bottom:4px; }
+
+        form.actions { margin-top:14px; display:flex; gap:10px; }
+        form.actions button {
+          flex:1; padding:8px 0; border:none; border-radius:5px; font-size:14px; font-weight:bold; cursor:pointer;
+        }
+        .accept { background:#2e8b57; color:#fff; }
+        .deny { background:#8b2e2e; color:#fff; }
+
+        .alt-status { font-size:16px; margin-top:10px; font-weight:bold; }
+        .alt-good { color:#3bd45a; }
+        .alt-medium { color:#d4c83b; }
+        .alt-bad { color:#e84d4d; }
       </style>
     </head>
     <body>
@@ -324,64 +351,49 @@ app.get("/panel", requireAuth, (req, res) => {
           <a href="/logout">Logout</a>
         </div>
       </header>
+
       <div class="container">
   `;
 
   if (requests.length === 0) {
-    html += `<p class="empty">No requests yet. Once players file immigration forms in-game, they'll appear here.</p>`;
+    html += `<p>No immigration requests yet.</p>`;
   } else {
-    // Oldest first (by serverReceivedAt or TimeStamp)
-    const sorted = [...requests].sort((a, b) => {
-      const ta = a.serverReceivedAt || a.TimeStamp || 0;
-      const tb = b.serverReceivedAt || b.TimeStamp || 0;
-      return ta - tb;
-    });
+    const sorted = [...requests].sort(
+      (a, b) => (a.serverReceivedAt || 0) - (b.serverReceivedAt || 0)
+    );
 
     html += `<div class="grid">`;
 
     for (const r of sorted) {
-      const statusClass =
-        r.status === "accepted"
-          ? "status-accepted"
-          : r.status === "denied"
-          ? "status-denied"
-          : "status-pending";
-
       html += `
-        <div class="card" data-user-id="${r.UserId}" data-request-id="${r.id}">
-          <div class="card-header">
-            <img class="avatar" src="" alt="avatar" />
-            <div>
-              <div class="name">${escapeHtml(r.RobloxName)} (${escapeHtml(
-        r.DisplayName
-      )})</div>
-              <div class="meta">UserId: ${r.UserId}</div>
-              <div class="meta roblox-age">Roblox age: loading...</div>
-              <div class="status-pill ${statusClass}">${r.status}</div>
-            </div>
+      <div class="card" data-user-id="${r.UserId}">
+        <div class="card-header">
+          <img class="avatar" src="" />
+          <div>
+            <div class="name">${escapeHtml(r.RobloxName)}</div>
+            <div class="meta">UserId: ${r.UserId}</div>
+            <div class="meta roblox-age">Age: loading...</div>
+            <div class="status-pill status-${r.status}">${r.status}</div>
           </div>
-          <div class="section">
-            <b>Desired State:</b> ${escapeHtml(r.DesiredState || "")}
-          </div>
-          <div class="section">
-            <b>Reason:</b>
-            <div class="reason">${escapeHtml(r.Reason || "")}</div>
-          </div>
-          <div class="section">
-            <b>Extra Info:</b>
-            <div class="reason">${escapeHtml(r.ExtraInfo || "")}</div>
-          </div>
-          <div class="section groups">
-            <b>Groups:</b>
-            <div class="groups-list">Loading...</div>
-          </div>
-          <form class="actions" method="POST" action="/request/decision">
-            <input type="hidden" name="id" value="${r.id}" />
-            <button type="submit" name="decision" value="accept" class="accept">Accept</button>
-            <button type="submit" name="decision" value="deny" class="deny">Deny</button>
-          </form>
         </div>
-      `;
+
+        <div class="alt-status alt-loading">Alt Status: Loading...</div>
+
+        <div class="section">
+          <b>Stats</b>
+          <div class="meta alt-age">Account Age: loading...</div>
+          <div class="meta alt-friends">Friends: loading...</div>
+          <div class="meta alt-favorites">Favorite Games: loading...</div>
+          <div class="meta alt-badges">Recent Badges: loading...</div>
+          <div class="meta alt-groups">Groups: loading...</div>
+        </div>
+
+        <form class="actions" method="POST" action="/request/decision">
+          <input type="hidden" name="id" value="${r.id}" />
+          <button type="submit" name="decision" value="accept" class="accept">Accept</button>
+          <button type="submit" name="decision" value="deny" class="deny">Deny</button>
+        </form>
+      </div>`;
     }
 
     html += `</div>`;
@@ -389,97 +401,140 @@ app.get("/panel", requireAuth, (req, res) => {
 
   html += `
       </div>
-      <script>
-        const BLACKLISTED_GROUP_IDS = ${blacklistArr};
 
-        function setAvatar(card, userId) {
-          const img = card.querySelector(".avatar");
-          img.src = "https://www.roblox.com/headshot-thumbnail/image?userId=" + userId + "&width=150&height=150&format=png";
-        }
+<script>
 
-        async function loadProfile(card, userId) {
-          try {
-            const ageEl = card.querySelector(".roblox-age");
-            const res = await fetch("https://users.roblox.com/v1/users/" + userId);
-            if (!res.ok) throw new Error("profile error");
-            const data = await res.json();
-            const created = new Date(data.created);
-            const now = new Date();
-            const ageDays = Math.floor((now - created) / (1000*60*60*24));
-            ageEl.textContent = "Roblox age: " + ageDays + " days (" + created.toLocaleDateString() + ")";
-          } catch (e) {
-            console.error(e);
-          }
-        }
+// ⭐ LOAD EVERYTHING + COMPUTE ALT STATUS
+async function evaluateAlt(card, userId) {
+  let score = 0;
 
-        async function loadGroups(card, userId) {
-          const container = card.querySelector(".groups-list");
-          try {
-            const res = await fetch("https://groups.roblox.com/v2/users/" + userId + "/groups/roles");
-            if (!res.ok) throw new Error("groups error");
-            const json = await res.json();
-            const groups = json.data || [];
+  // --- Load Account Age
+  let ageDays = 0;
+  try {
+    const res = await fetch("https://users.roblox.com/v1/users/" + userId);
+    const data = await res.json();
+    const created = new Date(data.created);
+    ageDays = Math.floor((Date.now() - created) / 86400000);
 
-            if (groups.length === 0) {
-              container.textContent = "No groups.";
-              return;
-            }
+    card.querySelector(".alt-age").textContent =
+      "Account Age: " + ageDays + " days";
 
-            container.innerHTML = "";
-            for (const g of groups) {
-              const groupId = g.group.id;
-              const row = document.createElement("div");
-              row.className = "group-row";
+    if (ageDays < 30) score += 4;
+    else if (ageDays < 90) score += 2;
 
-              const icon = document.createElement("img");
-              icon.className = "group-icon";
-              icon.src = "https://thumbnails.roblox.com/v1/groups/icons?groupIds=" + groupId + "&size=150x150&format=Png&isCircular=false";
+  } catch {
+    card.querySelector(".alt-age").textContent = "Account Age: failed";
+  }
 
-              const textWrap = document.createElement("div");
-              const nameSpan = document.createElement("span");
-              nameSpan.className = "group-name";
-              nameSpan.textContent = g.group.name;
+  // --- Load Friends
+  let friendCount = 0;
+  try {
+    const res = await fetch(
+      "https://friends.roblox.com/v1/users/" + userId + "/friends/count"
+    );
+    const data = await res.json();
+    friendCount = data.count || 0;
+    card.querySelector(".alt-friends").textContent =
+      "Friends: " + friendCount;
 
-              const roleSpan = document.createElement("span");
-              roleSpan.className = "group-role";
-              roleSpan.textContent = " — " + g.role.name;
+    if (friendCount === 0) score += 3;
+    else if (friendCount <= 3) score += 1;
 
-              textWrap.appendChild(nameSpan);
-              textWrap.appendChild(roleSpan);
+  } catch {
+    card.querySelector(".alt-friends").textContent = "Friends: failed";
+  }
 
-              const isBlacklisted = BLACKLISTED_GROUP_IDS.includes(groupId);
-              if (isBlacklisted) {
-                const badge = document.createElement("span");
-                badge.className = "group-badge blacklisted";
-                badge.textContent = "BLACKLISTED";
-                textWrap.appendChild(badge);
-              }
+  // --- Favorites
+  try {
+    const res = await fetch(
+      "https://games.roblox.com/v1/users/" +
+        userId +
+        "/favorite/games?limit=10"
+    );
+    const data = await res.json();
+    const count = (data.data || []).length;
 
-              row.appendChild(icon);
-              row.appendChild(textWrap);
-              container.appendChild(row);
-            }
-          } catch (e) {
-            console.error(e);
-            container.textContent = "Failed to load groups.";
-          }
-        }
+    card.querySelector(".alt-favorites").textContent =
+      "Favorite Games: " + count;
 
-        function init() {
-          const cards = document.querySelectorAll(".card[data-user-id]");
-          cards.forEach(card => {
-            const userId = card.getAttribute("data-user-id");
-            setAvatar(card, userId);
-            loadProfile(card, userId);
-            loadGroups(card, userId);
-          });
-        }
+    if (count === 0) score += 1;
 
-        window.addEventListener("load", init);
-      </script>
+  } catch {
+    card.querySelector(".alt-favorites").textContent =
+      "Favorite Games: failed";
+  }
+
+  // --- Badges
+  try {
+    const res = await fetch(
+      "https://badges.roblox.com/v1/users/" + userId + "/badges?limit=10"
+    );
+    const data = await res.json();
+    const count = (data.data || []).length;
+
+    card.querySelector(".alt-badges").textContent =
+      "Recent Badges: " + count;
+
+    if (count === 0) score += 1;
+
+  } catch {
+    card.querySelector(".alt-badges").textContent =
+      "Recent Badges: failed";
+  }
+
+  // --- Groups (via proxy to avoid CORS)
+  try {
+    const res = await fetch("/proxy/groups/" + userId);
+    const data = await res.json();
+    const count = (data.data || []).length;
+
+    card.querySelector(".alt-groups").textContent = "Groups: " + count;
+
+    if (count < 2) score += 1;
+
+  } catch {
+    card.querySelector(".alt-groups").textContent = "Groups: failed";
+  }
+
+  // ⭐ Final Verdict
+  let verdict = "";
+  let cssClass = "";
+
+  if (score <= 2) {
+    verdict = "Not an Alt";
+    cssClass = "alt-good";
+  } else if (score <= 5) {
+    verdict = "Possibly an Alt";
+    cssClass = "alt-medium";
+  } else {
+    verdict = "Definitely an Alt";
+    cssClass = "alt-bad";
+  }
+
+  const altBox = card.querySelector(".alt-status");
+  altBox.textContent = "Alt Status: " + verdict;
+  altBox.classList.remove("alt-loading");
+  altBox.classList.add(cssClass);
+}
+
+// ⭐ Initialize all requests
+function init() {
+  const cards = document.querySelectorAll(".card[data-user-id]");
+  cards.forEach((card) => {
+    const userId = card.getAttribute("data-user-id");
+    card.querySelector(".avatar").src =
+      "https://api.newstargeted.com/roblox/users/v1/avatar-headshot?userid=" +
+      userId;
+
+    evaluateAlt(card, userId);
+  });
+}
+
+window.addEventListener("load", init);
+</script>
+
     </body>
-  </html>
-  `;
+  </html>`;
 
   res.send(html);
 });
