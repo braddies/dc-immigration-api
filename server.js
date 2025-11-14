@@ -237,6 +237,33 @@ app.post("/request/decision", requireAuth, async (req, res) => {
   res.redirect("/panel");
 });
 
+// ---------------- STATUS ENDPOINT (USED BY ROBLOX) ----------------
+// GET /status?userId=123
+app.get("/status", (req, res) => {
+  const userId = parseInt(req.query.userId, 10);
+  if (!userId) {
+    return res.status(400).json({ error: "Missing or invalid userId" });
+  }
+
+  // Find latest request for this user (by time/id)
+  const userRequests = requests.filter(r => Number(r.UserId) === userId);
+  if (userRequests.length === 0) {
+    return res.json({ status: "none" });
+  }
+
+  const latest = userRequests.reduce((a, b) => {
+    const ta = a.serverReceivedAt || a.TimeStamp || 0;
+    const tb = b.serverReceivedAt || b.TimeStamp || 0;
+    return ta >= tb ? a : b;
+  });
+
+  res.json({
+    status: latest.status || "pending",
+    lastId: latest.id,
+    lastTime: latest.serverReceivedAt || latest.TimeStamp || null
+  });
+});
+
 // ---------------- PANEL ----------------
 app.get("/panel", requireAuth, (req, res) => {
   const blacklistArr = JSON.stringify(BLACKLISTED_GROUPS);
@@ -294,25 +321,32 @@ app.get("/panel", requireAuth, (req, res) => {
 
   if (requests.length === 0) {
     html += `<p class="empty">No requests yet. Once players file immigration forms in-game, they'll appear here.</p>`;
-  } else {
-    html += `<div class="grid">`;
+  } } else {
+  // Oldest first (by serverReceivedAt or id)
+  const sorted = [...requests].sort((a, b) => {
+    const ta = a.serverReceivedAt || a.TimeStamp || 0;
+    const tb = b.serverReceivedAt || b.TimeStamp || 0;
+    return ta - tb;
+  });
 
-    for (const r of requests) {
-      const statusClass =
-        r.status === "accepted"
-          ? "status-accepted"
-          : r.status === "denied"
-          ? "status-denied"
-          : "status-pending";
+  html += `<div class="grid">`;
 
-      html += `
-        <div class="card" data-user-id="${r.UserId}" data-request-id="${r.id}">
-          <div class="card-header">
-            <img class="avatar" src="" alt="avatar" />
-            <div>
-              <div class="name">${escapeHtml(r.RobloxName)} (${escapeHtml(
-        r.DisplayName
-      )})</div>
+  for (const r of sorted) {
+    const statusClass =
+      r.status === "accepted"
+        ? "status-accepted"
+        : r.status === "denied"
+        ? "status-denied"
+        : "status-pending";
+
+    html += `
+      <div class="card" data-user-id="${r.UserId}" data-request-id="${r.id}">
+        ...
+    `;
+  }
+
+  html += `</div>`;
+})</div>
               <div class="meta">UserId: ${r.UserId}</div>
               <div class="meta roblox-age">Roblox age: loading...</div>
               <div class="status-pill ${statusClass}">${r.status}</div>
