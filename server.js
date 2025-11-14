@@ -109,18 +109,17 @@ function requireAuth(req, res, next) {
 // ---------------- ROBLOX LOGIN ----------------
 async function initRoblox() {
   if (!ROBLOX_COOKIE) {
-    console.warn(
-      "[ROBLOX] ROBLOX_COOKIE not set; ranking will be disabled."
-    );
+    console.warn("[ROBLOX] ROBLOX_COOKIE not set; ranking will be disabled.");
     return;
   }
   try {
     const user = await noblox.setCookie(ROBLOX_COOKIE);
 
-    // Just log the full object so we see exactly what fields exist
-    console.log("[ROBLOX] Login result:", user);
+    // TEMP: show exactly what noblox gives us
+    console.log("[ROBLOX] Login result object:", user);
+    console.log("[ROBLOX] Login result keys:", Object.keys(user));
 
-    // If you want a cleaner line once you see the fields, you can adjust, e.g.:
+    // once you see the fields in the logs, you can change this to something like:
     // console.log(`[ROBLOX] Logged in as ${user.name || user.Username} (ID: ${user.id || user.UserID})`);
   } catch (e) {
     console.error("[ROBLOX] Failed to log in with cookie:", e);
