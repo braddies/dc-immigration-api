@@ -17,6 +17,11 @@ app.use(bodyParser.urlencoded({ extended: false }));
 const sessions = new Map();          // token -> { created, username }
 const comments = new Map();          // userId -> { text, updatedBy, updatedAt }
 
+// Elections + Parties (in-memory only)
+const elections = new Map();         // key -> election object
+const parties = [];                  // { id, name }
+let nextPartyId = 1;
+
 // ---------------- AUTH CONFIG ----------------
 // ADMIN_ACCOUNTS (env) = JSON string like:
 // [
@@ -208,12 +213,53 @@ async function rankRobloxUser(userId, outcome) {
   }
 }
 
+// ---------------- ELECTIONS DATA ----------------
+function initElections() {
+  if (elections.size > 0) return;
+
+  function base(key, name) {
+    return {
+      key,
+      name,
+      enabled: false,
+      registrationEnd: null,   // timestamp ms
+      electionEnd: null,       // timestamp ms
+      requiredSignatures: 0,
+      electionStarted: false,
+      resultsFinalized: false,
+      registrations: [],       // future: { userId, username, displayName, signatures, partyId, onBallot }
+      votes: []                // future: { voterUserId, candidateUserId, timestamp }
+    };
+  }
+
+  elections.set("presidential", base("presidential", "Presidential Elections"));
+  elections.set("senate", base("senate", "Senate Elections"));
+  elections.set("house", base("house", "House Elections"));
+  elections.set("mayor", base("mayor", "Mayor Elections"));
+  elections.set("custom1", base("custom1", "Custom Election"));
+}
+initElections();
+
+function getElectionPhase(e, nowMs = Date.now()) {
+  if (!e.enabled) return "Disabled";
+  if (!e.registrationEnd || !e.electionEnd) return "Setup";
+
+  const regEnd = e.registrationEnd;
+  const elEnd = e.electionEnd;
+
+  if (nowMs < regEnd) return "Registration";
+  if (!e.electionStarted) return "Filtering (Registrations)";
+  if (nowMs < elEnd) return "Voting";
+  if (!e.resultsFinalized) return "Filtering (Results)";
+  return "Completed";
+}
+
 // ---------------- LOGIN ROUTES ----------------
 app.get("/login", (req, res) => {
   const html = `
   <html>
     <head>
-      <title>DC Immigration Login</title>
+      <title>DC Control Panel Login</title>
       <style>
         body { font-family: Arial, sans-serif; background:#0b0b0f; color:#eee;
                display:flex; justify-content:center; align-items:center;
@@ -346,6 +392,78 @@ app.post("/decision", requireAuth, async (req, res) => {
   res.redirect("/panel");
 });
 
+// ---------------- ELECTIONS ROUTES (SERVER STATE) ----------------
+app.post("/elections/toggle", requireAuth, (req, res) => {
+  const { key, enabled } = req.body || {};
+  const e = elections.get(key);
+  if (!e) return res.status(404).send("Unknown election key");
+  e.enabled = enabled === "1";
+  res.redirect("/elections");
+});
+
+app.post("/elections/update", requireAuth, (req, res) => {
+  const { key, registrationEnd, electionEnd, requiredSignatures, name } =
+    req.body || {};
+  const e = elections.get(key);
+  if (!e) return res.status(404).send("Unknown election key");
+
+  if (registrationEnd) {
+    e.registrationEnd = Date.parse(registrationEnd);
+  } else {
+    e.registrationEnd = null;
+  }
+
+  if (electionEnd) {
+    e.electionEnd = Date.parse(electionEnd);
+  } else {
+    e.electionEnd = null;
+  }
+
+  e.requiredSignatures = parseInt(requiredSignatures || "0", 10) || 0;
+
+  // allow renaming custom election
+  if (key === "custom1" && name && name.trim().length > 0) {
+    e.name = name.trim();
+  }
+
+  res.redirect("/elections");
+});
+
+app.post("/elections/begin", requireAuth, (req, res) => {
+  const { key } = req.body || {};
+  const e = elections.get(key);
+  if (!e) return res.status(404).send("Unknown election key");
+  e.electionStarted = true;
+  res.redirect("/elections");
+});
+
+app.post("/elections/finalize", requireAuth, (req, res) => {
+  const { key } = req.body || {};
+  const e = elections.get(key);
+  if (!e) return res.status(404).send("Unknown election key");
+  e.resultsFinalized = true;
+  res.redirect("/elections");
+});
+
+// Parties
+app.post("/elections/party/add", requireAuth, (req, res) => {
+  const { name } = req.body || {};
+  if (!name || !name.trim()) return res.redirect("/elections");
+  parties.push({
+    id: nextPartyId++,
+    name: name.trim(),
+  });
+  res.redirect("/elections");
+});
+
+app.post("/elections/party/delete", requireAuth, (req, res) => {
+  const { id } = req.body || {};
+  const pid = parseInt(id || "0", 10);
+  const idx = parties.findIndex((p) => p.id === pid);
+  if (idx !== -1) parties.splice(idx, 1);
+  res.redirect("/elections");
+});
+
 // ---------------- PANEL (IMMIGRATION OFFICE + FAILED) ----------------
 app.get("/panel", requireAuth, async (req, res) => {
   const loggedInAs = req.session.username || "unknown";
@@ -358,12 +476,30 @@ app.get("/panel", requireAuth, async (req, res) => {
   let html = `
   <html>
     <head>
-      <title>Immigration Requests</title>
+      <title>Immigration Panel</title>
       <style>
         body { font-family: Arial, sans-serif; background:#050509; color:#eee; margin:0; }
+
         header { display:flex; justify-content:space-between; align-items:center;
-                 padding:16px 24px; background:#101018; border-bottom:1px solid #222; }
-        header h1 { margin:0; font-size:22px; }
+                 padding:12px 20px; background:#101018; border-bottom:1px solid #222; position:relative; }
+        .header-left { display:flex; align-items:center; gap:10px; }
+        .logo { font-weight:bold; font-size:18px; }
+        .hamburger {
+          width:32px; height:32px; border-radius:999px;
+          border:1px solid #333; background:#181824; color:#eee;
+          display:flex; align-items:center; justify-content:center;
+          cursor:pointer; font-size:18px;
+        }
+        .hamburger:hover { background:#242437; }
+
+        .nav-links { display:flex; gap:8px; }
+        .nav-link {
+          color:#ccc; text-decoration:none; font-size:13px;
+          padding:6px 12px; border-radius:999px;
+        }
+        .nav-link:hover { background:#1e1e2b; color:#fff; }
+        .nav-link.active { background:#3478f6; color:#fff; }
+
         header .right { font-size:13px; color:#aaa; display:flex; align-items:center; gap:12px; }
         header a { color:#f06464; text-decoration:none; }
 
@@ -426,11 +562,30 @@ app.get("/panel", requireAuth, async (req, res) => {
         }
         .accept { background:#2e8b57; color:#fff; }
         .deny { background:#8b2e2e; color:#fff; }
+
+        @media (max-width: 720px) {
+          .nav-links {
+            position:absolute;
+            left:0; right:0; top:52px;
+            background:#101018;
+            flex-direction:column;
+            padding:8px 20px;
+            display:none;
+          }
+          .nav-links.open { display:flex; }
+        }
       </style>
     </head>
     <body>
       <header>
-        <h1>Immigration Requests (${totalCount})</h1>
+        <div class="header-left">
+          <button class="hamburger" id="menuToggle">☰</button>
+          <div class="logo">RUS Control</div>
+          <nav class="nav-links" id="mainNav">
+            <a href="/panel" class="nav-link active">Immigration</a>
+            <a href="/elections" class="nav-link">Elections</a>
+          </nav>
+        </div>
         <div class="right">
           <button class="refresh-btn" id="refreshBtn">⟳ Refresh</button>
           <span>Logged in as <b>${escapeHtml(loggedInAs)}</b></span>
@@ -564,6 +719,12 @@ app.get("/panel", requireAuth, async (req, res) => {
 
   document.getElementById("refreshBtn").addEventListener("click", () => {
     window.location.reload();
+  });
+
+  const menuToggle = document.getElementById("menuToggle");
+  const mainNav = document.getElementById("mainNav");
+  menuToggle.addEventListener("click", () => {
+    mainNav.classList.toggle("open");
   });
 
   // ---- ALT CHECK + AGE ----
@@ -736,6 +897,313 @@ app.get("/panel", requireAuth, async (req, res) => {
   }
 
   window.addEventListener("load", init);
+</script>
+
+    </body>
+  </html>
+  `;
+
+  res.send(html);
+});
+
+// ---------------- ELECTIONS PAGE ----------------
+app.get("/elections", requireAuth, (req, res) => {
+  const loggedInAs = req.session.username || "unknown";
+
+  let html = `
+  <html>
+    <head>
+      <title>Elections Management</title>
+      <style>
+        body { font-family: Arial, sans-serif; background:#050509; color:#eee; margin:0; }
+
+        header { display:flex; justify-content:space-between; align-items:center;
+                 padding:12px 20px; background:#101018; border-bottom:1px solid #222; position:relative; }
+        .header-left { display:flex; align-items:center; gap:10px; }
+        .logo { font-weight:bold; font-size:18px; }
+        .hamburger {
+          width:32px; height:32px; border-radius:999px;
+          border:1px solid #333; background:#181824; color:#eee;
+          display:flex; align-items:center; justify-content:center;
+          cursor:pointer; font-size:18px;
+        }
+        .hamburger:hover { background:#242437; }
+
+        .nav-links { display:flex; gap:8px; }
+        .nav-link {
+          color:#ccc; text-decoration:none; font-size:13px;
+          padding:6px 12px; border-radius:999px;
+        }
+        .nav-link:hover { background:#1e1e2b; color:#fff; }
+        .nav-link.active { background:#3478f6; color:#fff; }
+
+        header .right { font-size:13px; color:#aaa; display:flex; align-items:center; gap:12px; }
+        header a { color:#f06464; text-decoration:none; }
+
+        .container { padding:20px; }
+        h2 { margin-top:24px; margin-bottom:8px; }
+        .sub { color:#aaa; font-size:13px; margin-bottom:16px; }
+
+        .election-grid { display:flex; flex-wrap:wrap; gap:16px; }
+        .election-card {
+          background:#15151f; border-radius:10px; padding:14px;
+          width:420px; box-shadow:0 0 15px rgba(0,0,0,0.4);
+        }
+
+        .election-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+        .election-title { font-weight:bold; font-size:16px; }
+
+        .pill { border-radius:999px; padding:4px 10px; font-size:11px; }
+        .pill-on { background:#2e8b57; }
+        .pill-off { background:#555; }
+        .pill-phase { background:#222; }
+
+        .field-row { display:flex; gap:8px; margin-top:8px; }
+        .field { flex:1; display:flex; flex-direction:column; font-size:12px; }
+        .field label { margin-bottom:2px; color:#aaa; }
+        .field input[type="datetime-local"],
+        .field input[type="number"],
+        .field input[type="text"] {
+          background:#101018; color:#eee; border-radius:4px; border:1px solid #333;
+          padding:4px 6px; font-size:12px;
+        }
+
+        .small-btn {
+          margin-top:8px; padding:6px 10px; border:none; border-radius:4px;
+          background:#3478f6; color:#fff; font-size:12px; cursor:pointer;
+        }
+        .small-btn.secondary { background:#2e2e3a; }
+        .small-btn.secondary:hover { background:#3d3d4a; }
+
+        .section { margin-top:10px; font-size:13px; }
+        .section b { display:block; margin-bottom:4px; }
+
+        .meta { font-size:12px; color:#aaa; }
+
+        .divider { margin:10px 0; border-top:1px solid #262633; }
+
+        .list { font-size:12px; max-height:120px; overflow:auto; }
+        .list-item { padding:2px 0; }
+
+        /* Parties */
+        .party-grid { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; }
+        .party-card {
+          background:#15151f; border-radius:8px; padding:8px 10px;
+          font-size:13px; display:flex; justify-content:space-between; align-items:center;
+        }
+        .party-delete {
+          border:none; border-radius:6px; padding:4px 8px;
+          background:#7a1f1f; color:#fff; font-size:11px; cursor:pointer;
+        }
+
+        @media (max-width: 720px) {
+          .nav-links {
+            position:absolute;
+            left:0; right:0; top:52px;
+            background:#101018;
+            flex-direction:column;
+            padding:8px 20px;
+            display:none;
+          }
+          .nav-links.open { display:flex; }
+        }
+      </style>
+    </head>
+    <body>
+      <header>
+        <div class="header-left">
+          <button class="hamburger" id="menuToggle">☰</button>
+          <div class="logo">RUS Control</div>
+          <nav class="nav-links" id="mainNav">
+            <a href="/panel" class="nav-link">Immigration</a>
+            <a href="/elections" class="nav-link active">Elections</a>
+          </nav>
+        </div>
+        <div class="right">
+          <span>Logged in as <b>${escapeHtml(loggedInAs)}</b></span>
+          <a href="/logout">Logout</a>
+        </div>
+      </header>
+
+      <div class="container">
+        <h2>Elections Management</h2>
+        <div class="sub">Toggle elections on/off, set dates, and manage parties. All data is in-memory and resets when the server restarts.</div>
+
+        <div class="election-grid">
+  `;
+
+  for (const e of elections.values()) {
+    const phase = getElectionPhase(e);
+    const enabled = e.enabled;
+    const regVal = e.registrationEnd
+      ? new Date(e.registrationEnd).toISOString().slice(0, 16)
+      : "";
+    const elVal = e.electionEnd
+      ? new Date(e.electionEnd).toISOString().slice(0, 16)
+      : "";
+    const reqSig = e.requiredSignatures || 0;
+
+    html += `
+      <div class="election-card">
+        <div class="election-header">
+          <div class="election-title">${escapeHtml(e.name)}</div>
+          <div>
+            <span class="pill ${enabled ? "pill-on" : "pill-off"}">${enabled ? "On" : "Off"}</span>
+            <span class="pill pill-phase">${escapeHtml(phase)}</span>
+          </div>
+        </div>
+
+        <form method="POST" action="/elections/toggle">
+          <input type="hidden" name="key" value="${e.key}" />
+          <input type="hidden" name="enabled" value="${enabled ? "0" : "1"}" />
+          <button class="small-btn secondary" type="submit">
+            ${enabled ? "Turn Off" : "Turn On"}
+          </button>
+        </form>
+
+        <form method="POST" action="/elections/update">
+          <input type="hidden" name="key" value="${e.key}" />
+          <div class="field-row">
+            <div class="field">
+              <label>Registration End</label>
+              <input type="datetime-local" name="registrationEnd" value="${regVal}" />
+            </div>
+            <div class="field">
+              <label>Election End</label>
+              <input type="datetime-local" name="electionEnd" value="${elVal}" />
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label>Required Signatures</label>
+              <input type="number" min="0" name="requiredSignatures" value="${reqSig}" />
+            </div>
+            ${
+              e.key === "custom1"
+                ? `<div class="field">
+                     <label>Custom Name</label>
+                     <input type="text" name="name" value="${escapeHtml(e.name)}" />
+                   </div>`
+                : ""
+            }
+          </div>
+
+          <button class="small-btn" type="submit">Save Settings</button>
+        </form>
+
+        <div class="section">
+          <b>Phase & Info</b>
+          <div class="meta">
+            Current Phase: ${escapeHtml(phase)}<br/>
+            Registration End: ${
+              e.registrationEnd ? new Date(e.registrationEnd).toLocaleString() : "Not set"
+            }<br/>
+            Election End: ${
+              e.electionEnd ? new Date(e.electionEnd).toLocaleString() : "Not set"
+            }<br/>
+            Signatures Required: ${reqSig}
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+          <b>Registrations</b>
+          <div class="meta">${
+            e.registrations.length === 0
+              ? "No registrations yet (game integration will populate this)."
+              : e.registrations.length + " tickets registered."
+          }</div>
+        </div>
+
+        <div class="section">
+          <b>Ballot Candidates</b>
+          <div class="meta">
+            ${
+              e.registrations.filter(r => r.onBallot).length === 0
+                ? "No candidates on the ballot yet."
+                : "Candidates on ballot will appear here."
+            }
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+          <b>Actions</b>
+          ${
+            phase === "Filtering (Registrations)"
+              ? `<form method="POST" action="/elections/begin" style="display:inline;">
+                   <input type="hidden" name="key" value="${e.key}" />
+                   <button class="small-btn" type="submit">Begin Election</button>
+                 </form>`
+              : ""
+          }
+          ${
+            phase === "Filtering (Results)"
+              ? `<form method="POST" action="/elections/finalize" style="display:inline;">
+                   <input type="hidden" name="key" value="${e.key}" />
+                   <button class="small-btn secondary" type="submit">Finalize Results</button>
+                 </form>`
+              : ""
+          }
+          ${
+            phase === "Completed"
+              ? `<div class="meta" style="margin-top:4px;">Election completed. Future: show printable results here.</div>`
+              : ""
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  // Party management section
+  html += `
+        </div> <!-- election-grid -->
+
+        <h2 style="margin-top:32px;">Party Management</h2>
+        <div class="sub">Add or remove political parties. Assignment to candidates will use these IDs later.</div>
+
+        <form method="POST" action="/elections/party/add" style="max-width:420px;">
+          <div class="field-row">
+            <div class="field">
+              <label>Party Name</label>
+              <input type="text" name="name" placeholder="Example: Liberal Party" />
+            </div>
+          </div>
+          <button class="small-btn" type="submit">Add Party</button>
+        </form>
+
+        <div class="party-grid">
+  `;
+
+  if (parties.length === 0) {
+    html += `<div class="meta" style="margin-top:8px;">No parties created yet.</div>`;
+  } else {
+    for (const p of parties) {
+      html += `
+          <div class="party-card">
+            <span>#${p.id} — ${escapeHtml(p.name)}</span>
+            <form method="POST" action="/elections/party/delete">
+              <input type="hidden" name="id" value="${p.id}" />
+              <button class="party-delete" type="submit">Remove</button>
+            </form>
+          </div>
+      `;
+    }
+  }
+
+  html += `
+        </div> <!-- party-grid -->
+      </div> <!-- container -->
+
+<script>
+  const menuToggle = document.getElementById("menuToggle");
+  const mainNav = document.getElementById("mainNav");
+  menuToggle.addEventListener("click", () => {
+    mainNav.classList.toggle("open");
+  });
 </script>
 
     </body>
