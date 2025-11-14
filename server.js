@@ -115,15 +115,17 @@ async function initRoblox() {
     return;
   }
   try {
-    const currentUser = await noblox.setCookie(ROBLOX_COOKIE);
-    console.log(
-      `[ROBLOX] Logged in as ${currentUser.UserName} (ID: ${currentUser.UserID})`
-    );
+    const user = await noblox.setCookie(ROBLOX_COOKIE);
+
+    // Just log the full object so we see exactly what fields exist
+    console.log("[ROBLOX] Login result:", user);
+
+    // If you want a cleaner line once you see the fields, you can adjust, e.g.:
+    // console.log(`[ROBLOX] Logged in as ${user.name || user.Username} (ID: ${user.id || user.UserID})`);
   } catch (e) {
     console.error("[ROBLOX] Failed to log in with cookie:", e);
   }
 }
-
 // Call but don't block startup if it fails
 initRoblox();
 
